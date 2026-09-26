@@ -121,6 +121,21 @@ async fn run() -> Result<()> {
         }
     }
 
+    // System-1 fast-decision engine (plans/system1-fast-decisions.md). Default `none`
+    // (disabled) reproduces today's behavior; a bad/unimplemented backend fails loudly
+    // at boot rather than silently.
+    // System-1 fast-decision engine was built inside `shared_settings` (config seed +
+    // persisted overlay) and lives in the runtime-swappable settings, so it can be
+    // changed live from the config page. Log the selected backend.
+    log::info!(
+        "system1 decision engine: {}",
+        settings.system1_view().backend
+    );
+
+    // Forecast provider (keyless Open-Meteo), shared by the System-1 weather fast path
+    // and the ambient push. `None` when weather is disabled.
+    let weather_provider = anamanti_core::weather::from_config(config.weather.enabled);
+
     let mut pipeline = Pipeline::with_settings(
         settings,
         memory,
@@ -130,7 +145,8 @@ async fn run() -> Result<()> {
     .with_chatlog(chatlog.clone())
     .with_promptlog(promptlog.clone())
     .with_follow_up(config.follow_up.clone())
-    .with_audio_dump(config.audio_dump_dir.clone());
+    .with_audio_dump(config.audio_dump_dir.clone())
+    .with_weather(weather_provider.clone());
     // Home location + household roster are grounded from the runtime settings
     // snapshot each turn (seeded from the config file's home_location at boot, then
     // editable from the config dashboard's Household tab), not fixed onto the pipeline.
@@ -230,7 +246,7 @@ async fn run() -> Result<()> {
     // for the household location and fans them out so the icon + temperature beside the
     // idle clock stay fresh. Dormant (no task) when weather is disabled in the config.
     let weather_svc = Arc::new(WeatherService::new());
-    if let Some(provider) = anamanti_core::weather::from_config(config.weather.enabled) {
+    if let Some(provider) = weather_provider.clone() {
         let imperial =
             anamanti_core::directions::units_are_imperial(config.weather_units.as_deref());
         anamanti_core::weather::service::spawn_periodic(

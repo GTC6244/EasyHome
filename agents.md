@@ -175,6 +175,9 @@ adb install build/app/outputs/flutter-apk/app-release.apk   # or: flutter run -d
 
 ```bash
 # Mac Mini Anamanti Core (the "brain"). Runs on the Mac, not the device.
+# Toolchain: pinned to rustc 1.92 via the repo-root `rust-toolchain.toml` (the embedded
+# HelixDB stack — foyer/crc-fast/roaring — requires >= 1.91). rustup auto-installs it on
+# first build; `rustup default 1.88` alone will fail dependency resolution.
 cargo test  --manifest-path anamanti-core/Cargo.toml           # unit + pipeline integration tests
 cargo clippy --manifest-path anamanti-core/Cargo.toml --all-targets -- -D warnings
 cargo run   --manifest-path anamanti-core/Cargo.toml --release # advertises _wyoming._tcp, serves turns
@@ -199,6 +202,8 @@ cargo run   --manifest-path anamanti-core/Cargo.toml --release # advertises _wyo
 #     UI: Tools tab → /tools)
 #   ANTHROPIC_OAUTH_TOKEN                (Claude subscription token from `claude setup-token`;
 #     UI: Config tab when Anthropic auth = subscription)
+#   OPENROUTER_API_KEY                   (the System-1 `jev` decision backend on OpenRouter;
+#     UI: System-1 tab → /system1. Only needed when system1.backend=jev)
 #   RUST_LOG                             (standard env_logger filter; env-only — read at
 #     process start, so it has no config-page control)
 #
@@ -222,6 +227,11 @@ cargo run   --manifest-path anamanti-core/Cargo.toml --release # advertises _wyo
 #     Anamanti Core ducks the music group while it speaks and — with music.autostart,
 #     also default on — supervises snapserver/librespot/mpv at boot; see
 #     anamanti.example.json for the full shape)
+#   system1{backend,base_url,openrouter_model,device,model,min_confidence,intents} — the
+#     pluggable System-1 fast-decision engine (plans/system1-fast-decisions.md). backend
+#     default "none" (disabled); "laya-serve" (local Laya-Decision sidecar on base_url,
+#     `/v1/systemone`) or "jev" (OpenRouter, needs OPENROUTER_API_KEY). Runtime-swappable
+#     + persisted; UI: System-1 tab → /system1. Resolves weather/timer before the LLM.
 #   calendar.subscriptions=[{name,url}], calendar.cache_ttl_secs (read-only web .ics;
 #     `webcal://` accepted; enables calendar_lookup; empty → tool not advertised)
 #   directions.provider="mapbox" (+ the MAPBOX_TOKEN secret, set via env or the Tools

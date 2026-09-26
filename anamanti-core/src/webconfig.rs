@@ -48,7 +48,7 @@ use crate::notify::{Notification, NotificationService};
 use crate::orchestrator::ServiceConnector;
 use crate::settings::{
     CadoraUpdate, DirectionsUpdate, DriveUpdate, Household, HouseholdMember, LlmEngine,
-    SettingsUpdate, SharedSettings, SpotifyUpdate,
+    SettingsUpdate, SharedSettings, SpotifyUpdate, System1Update,
 };
 
 /// Read-only data sources the debug pages render (chat log, prompts, SQLite,
@@ -162,6 +162,11 @@ fn sidebar_html(active: &str) -> String {
                     "/tools",
                     "Tools",
                     r##"<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2-2z"/>"##,
+                ),
+                (
+                    "/system1",
+                    "System-1",
+                    r##"<path d="M13 2L3 14h9l-1 8 10-12h-9z"/>"##,
                 ),
                 (
                     "/notifications",
@@ -297,6 +302,7 @@ const NOTIFY_BODY: &str = include_str!("webconfig/notifications.html");
 /// people who live here with their emails + phone numbers. A full-record save. Uses
 /// a private `apiJSON` helper (not the shell's GET-only `getJSON`).
 const HOUSEHOLD_BODY: &str = include_str!("webconfig/household.html");
+const SYSTEM1_BODY: &str = include_str!("webconfig/system1.html");
 
 /// Cap on request bytes we buffer before the body — a config request is tiny; this
 /// just bounds a misbehaving/hostile client on the (unauthenticated) socket.
@@ -430,6 +436,23 @@ async fn handle(
     // Save the Mapbox token for the directions tool (rebuilds the tool set live).
     if method == "POST" && path == "/tools/save" {
         let payload = directions_save_json(&settings, &body);
+        return write_response(
+            &mut stream,
+            "200 OK",
+            "application/json",
+            payload.as_bytes(),
+        )
+        .await;
+    }
+
+    // System-1 fast-decision engine: current selection + a live swap (rebuilds the
+    // engine, persists, takes effect on the next turn).
+    if method == "GET" && path == "/system1/status.json" {
+        let payload = system1_status_json(&settings).into_bytes();
+        return write_response(&mut stream, "200 OK", "application/json", &payload).await;
+    }
+    if method == "POST" && path == "/system1/save" {
+        let payload = system1_save_json(&settings, &body);
         return write_response(
             &mut stream,
             "200 OK",
@@ -865,6 +888,57 @@ fn directions_save_json(settings: &SharedSettings, body: &[u8]) -> String {
     };
     settings.apply_directions(&DirectionsUpdate { mapbox_token });
     directions_status_json(settings)
+}
+
+/// Current System-1 selection for the config page. Never returns the OpenRouter key,
+/// only whether one is set.
+fn system1_status_json(settings: &SharedSettings) -> String {
+    let v = settings.system1_view();
+    json!({
+        "ok": true,
+        "backend": v.backend,
+        "base_url": v.base_url,
+        "model": v.model,
+        "min_confidence": v.min_confidence,
+        "openrouter_key_set": v.openrouter_key_set,
+        "intents": v.intents,
+        "active": v.backend != "none",
+    })
+    .to_string()
+}
+
+/// Apply a System-1 selection from the config page (rebuilds the engine live + persists).
+/// A blank `openrouter_api_key` means "leave unchanged" (never shown back). On a build
+/// failure (e.g. unknown backend) the current engine is left untouched and the error is
+/// returned.
+fn system1_save_json(settings: &SharedSettings, body: &[u8]) -> String {
+    let data: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({ "ok": false, "message": format!("invalid JSON: {e}") }).to_string()
+        }
+    };
+    let opt_str = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+    };
+    let update = System1Update {
+        backend: opt_str("backend").filter(|s| !s.is_empty()),
+        base_url: opt_str("base_url").filter(|s| !s.is_empty()),
+        model: opt_str("model").filter(|s| !s.is_empty()),
+        min_confidence: data.get("min_confidence").and_then(Value::as_f64),
+        // Blank = keep the current key (it is never echoed back to the page).
+        openrouter_api_key: match data.get("openrouter_api_key").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => Some(Some(s.trim().to_string())),
+            _ => None,
+        },
+        intents: None,
+    };
+    match settings.apply_system1(&update) {
+        Ok(_) => system1_status_json(settings),
+        Err(e) => json!({ "ok": false, "message": format!("{e:#}") }).to_string(),
+    }
 }
 
 /// `GET /household/status.json` — the canonical household record (home location +
@@ -1406,6 +1480,11 @@ fn route(
             "text/html; charset=utf-8",
             page("/tools", "Tools", TOOLS_BODY).into_bytes(),
         ),
+        ("GET", "/system1") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            page("/system1", "System-1", SYSTEM1_BODY).into_bytes(),
+        ),
         ("GET", "/notifications") => (
             "200 OK",
             "text/html; charset=utf-8",
@@ -1850,6 +1929,21 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Link Google Drive"));
         assert!(html.contains("href=\"/helix\""), "missing shared nav");
+    }
+
+    #[test]
+    fn get_system1_page_renders_with_nav_and_status_reports_default() {
+        let s = settings();
+        let (status, ctype, body) = route("GET", "/system1", b"", &s);
+        assert_eq!(status, "200 OK");
+        assert!(ctype.starts_with("text/html"));
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Decision engine"), "system1 page body");
+        assert!(html.contains("href=\"/system1\""), "nav links system1");
+        // The status endpoint reports the default disabled engine.
+        let json = system1_status_json(&s);
+        assert!(json.contains("\"backend\":\"none\""), "status: {json}");
+        assert!(json.contains("\"active\":false"), "status: {json}");
     }
 
     #[test]

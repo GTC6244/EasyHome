@@ -441,6 +441,33 @@ pub struct PersistedSettings {
     /// files.
     #[serde(default)]
     pub cadora: CadoraConfig,
+    /// Selected System-1 backend. Defaults to **empty** (not "none") for older files, so
+    /// an old persisted file can't clobber a config-file `system1.backend` seed — the
+    /// overlay only applies when this is non-empty (a save always writes a real label).
+    #[serde(default)]
+    pub system1_backend: String,
+    #[serde(default = "default_system1_base_url")]
+    pub system1_base_url: String,
+    #[serde(default = "default_system1_model")]
+    pub system1_model: String,
+    #[serde(default = "default_system1_min_confidence")]
+    pub system1_min_confidence: f64,
+    #[serde(default)]
+    pub system1_intents: Vec<String>,
+    /// Runtime-set OpenRouter API key (config page). Defaulted (absent) for older files,
+    /// which then fall back to the `OPENROUTER_API_KEY` env seed.
+    #[serde(default)]
+    pub openrouter_api_key: Option<String>,
+}
+
+fn default_system1_base_url() -> String {
+    DEFAULT_SYSTEM1_BASE_URL.to_string()
+}
+fn default_system1_model() -> String {
+    DEFAULT_SYSTEM1_MODEL.to_string()
+}
+fn default_system1_min_confidence() -> f64 {
+    DEFAULT_SYSTEM1_MIN_CONFIDENCE
 }
 
 /// Load persisted settings, or `None` if the file is absent/unreadable.
@@ -741,6 +768,78 @@ pub struct RuntimeSettings {
     /// (via [`CadoraConfig::controller`]) so the `shopping_list_add` tool is
     /// advertised/withdrawn live.
     pub cadora: CadoraConfig,
+    /// The live System-1 fast-decision selection (plans/system1-fast-decisions.md), read
+    /// from the per-turn snapshot so a config-page swap takes effect between turns.
+    /// Bundled into one field so the widely-constructed `RuntimeSettings` only gains one.
+    pub system1: System1Runtime,
+}
+
+/// Default System-1 HTTP base URL (local `laya-serve`).
+pub const DEFAULT_SYSTEM1_BASE_URL: &str = "http://127.0.0.1:8000";
+/// Default System-1 OpenRouter model id (the `jev` backend).
+pub const DEFAULT_SYSTEM1_MODEL: &str = "typesafe/jev-1.13";
+/// Default System-1 confidence floor.
+pub const DEFAULT_SYSTEM1_MIN_CONFIDENCE: f64 = 0.85;
+
+/// The live System-1 selection: the built engine plus the descriptor needed to rebuild
+/// it on a config-page swap and report the current choice. `Default` = disabled
+/// (`NoDecision`), so a `RuntimeSettings` literal can spell it `System1Runtime::default()`.
+#[derive(Clone)]
+pub struct System1Runtime {
+    /// The live decision engine (`name() == "none"` ⇒ the turn logic skips the stage).
+    pub engine: Arc<dyn crate::system1::DecisionEngine>,
+    /// Selected backend label (`none`/`laya-serve`/`jev`/…).
+    pub backend: String,
+    /// HTTP base URL (`laya-serve` host, or the OpenRouter API root for `jev`).
+    pub base_url: String,
+    /// Model id for the `jev` backend (OpenRouter).
+    pub model: String,
+    /// Confidence floor below which a decision defers to System-2.
+    pub min_confidence: f64,
+    /// Allowed intents (empty = the built-in default set).
+    pub intents: Vec<String>,
+    /// Live OpenRouter API key for `jev`. Runtime-settable (config page); seeded from
+    /// `OPENROUTER_API_KEY` at boot. `None` = unset.
+    pub openrouter_api_key: Option<String>,
+}
+
+impl Default for System1Runtime {
+    fn default() -> Self {
+        Self {
+            engine: crate::system1::none(),
+            backend: "none".to_string(),
+            base_url: DEFAULT_SYSTEM1_BASE_URL.to_string(),
+            model: DEFAULT_SYSTEM1_MODEL.to_string(),
+            min_confidence: DEFAULT_SYSTEM1_MIN_CONFIDENCE,
+            intents: Vec::new(),
+            openrouter_api_key: None,
+        }
+    }
+}
+
+/// A description of the live System-1 selection, for the config page. Never exposes the
+/// OpenRouter key (only whether one is set).
+#[derive(Debug, Clone, PartialEq)]
+pub struct System1View {
+    pub backend: String,
+    pub base_url: String,
+    pub model: String,
+    pub min_confidence: f64,
+    pub openrouter_key_set: bool,
+    pub intents: Vec<String>,
+}
+
+/// A requested System-1 change (config page). Absent fields are left unchanged;
+/// `openrouter_api_key` is tri-state (`None` = keep, `Some(None)` = clear,
+/// `Some(Some(v))` = set).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct System1Update {
+    pub backend: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub min_confidence: Option<f64>,
+    pub openrouter_api_key: Option<Option<String>>,
+    pub intents: Option<Vec<String>>,
 }
 
 /// A description of the settings currently in effect, for reporting back to the
@@ -854,6 +953,12 @@ impl SharedSettings {
             household: s.household.clone(),
             spotify: s.spotify.clone(),
             cadora: s.cadora.clone(),
+            system1_backend: s.system1.backend.clone(),
+            system1_base_url: s.system1.base_url.clone(),
+            system1_model: s.system1.model.clone(),
+            system1_min_confidence: s.system1.min_confidence,
+            system1_intents: s.system1.intents.clone(),
+            openrouter_api_key: s.system1.openrouter_api_key.clone(),
         }
     }
 
@@ -906,6 +1011,7 @@ impl SharedSettings {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
         )
     }
@@ -1152,6 +1258,97 @@ impl SharedSettings {
             persist(path, &snap);
         }
         cleaned
+    }
+
+    /// A snapshot of the live System-1 selection for the config page (never the key).
+    pub fn system1_view(&self) -> System1View {
+        let s = self.inner.read().unwrap();
+        System1View {
+            backend: s.system1.backend.clone(),
+            base_url: s.system1.base_url.clone(),
+            model: s.system1.model.clone(),
+            min_confidence: s.system1.min_confidence,
+            openrouter_key_set: s
+                .system1
+                .openrouter_api_key
+                .as_deref()
+                .is_some_and(|k| !k.is_empty()),
+            intents: s.system1.intents.clone(),
+        }
+    }
+
+    /// Directly install a System-1 engine object (no persist). Used at boot by
+    /// `Pipeline::with_system1` and by tests to inject a scripted engine; the config
+    /// page uses [`apply_system1`](Self::apply_system1) instead.
+    pub fn set_system1(&self, engine: Arc<dyn crate::system1::DecisionEngine>) {
+        let mut w = self.inner.write().unwrap();
+        w.system1.backend = engine.name().to_string();
+        w.system1.engine = engine;
+    }
+
+    /// Apply a System-1 config change: rebuild the engine (before taking the write lock,
+    /// so a failed build leaves settings untouched), swap it in, and persist. Orthogonal
+    /// to the LLM backend. Returns the resulting [`System1View`].
+    pub fn apply_system1(&self, update: &System1Update) -> Result<System1View> {
+        let (backend, base_url, model, min_conf, intents, api_key) = {
+            let current = self.inner.read().unwrap();
+            let s1 = &current.system1;
+            let backend = update.backend.clone().unwrap_or_else(|| s1.backend.clone());
+            let base_url = update.base_url.clone().unwrap_or_else(|| s1.base_url.clone());
+            let model = update.model.clone().unwrap_or_else(|| s1.model.clone());
+            let min_conf = update
+                .min_confidence
+                .unwrap_or(s1.min_confidence)
+                .clamp(0.0, 1.0);
+            let intents = update.intents.clone().unwrap_or_else(|| s1.intents.clone());
+            let api_key = match &update.openrouter_api_key {
+                None => s1.openrouter_api_key.clone(),
+                Some(k) => k.clone().filter(|s| !s.is_empty()),
+            };
+            (backend, base_url, model, min_conf, intents, api_key)
+        };
+
+        // Build before the write lock so a bad backend can't half-apply.
+        let engine = crate::system1::build(
+            &backend,
+            &base_url,
+            &model,
+            api_key.clone(),
+            min_conf,
+            intents.clone(),
+        )?;
+
+        let mut w = self.inner.write().unwrap();
+        w.system1 = System1Runtime {
+            engine,
+            backend,
+            base_url,
+            model,
+            min_confidence: min_conf,
+            intents,
+            openrouter_api_key: api_key,
+        };
+        let view = System1View {
+            backend: w.system1.backend.clone(),
+            base_url: w.system1.base_url.clone(),
+            model: w.system1.model.clone(),
+            min_confidence: w.system1.min_confidence,
+            openrouter_key_set: w
+                .system1
+                .openrouter_api_key
+                .as_deref()
+                .is_some_and(|k| !k.is_empty()),
+            intents: w.system1.intents.clone(),
+        };
+        let snapshot = self
+            .persist_path
+            .is_some()
+            .then(|| Self::persisted_snapshot(&w));
+        drop(w);
+        if let (Some(path), Some(snap)) = (&self.persist_path, snapshot) {
+            persist(path, &snap);
+        }
+        Ok(view)
     }
 
     /// Apply a Drive config change and persist it (best-effort, 0600). Drive is
@@ -1458,8 +1655,46 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
         )
+    }
+
+    #[test]
+    fn apply_system1_swaps_and_reports_the_backend() {
+        let s = shared(factory_with_key(None));
+        // Starts disabled.
+        assert_eq!(s.system1_view().backend, "none");
+        assert_eq!(s.snapshot().system1.engine.name(), "none");
+
+        // Swap to the local laya-serve backend (no network needed to construct it).
+        let view = s
+            .apply_system1(&System1Update {
+                backend: Some("laya-serve".to_string()),
+                base_url: Some("http://127.0.0.1:9999".to_string()),
+                min_confidence: Some(0.9),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(view.backend, "laya-serve");
+        assert!((view.min_confidence - 0.9).abs() < 1e-9);
+        assert_eq!(s.snapshot().system1.engine.name(), "laya-serve");
+
+        // An unknown backend is rejected and leaves the current engine untouched.
+        let err = s.apply_system1(&System1Update {
+            backend: Some("bogus".to_string()),
+            ..Default::default()
+        });
+        assert!(err.is_err());
+        assert_eq!(s.system1_view().backend, "laya-serve");
+
+        // Back to disabled.
+        s.apply_system1(&System1Update {
+            backend: Some("none".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.snapshot().system1.engine.name(), "none");
     }
 
     #[test]
@@ -1547,6 +1782,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );
@@ -1697,6 +1933,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );
@@ -1836,6 +2073,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );
@@ -1905,6 +2143,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );
@@ -1982,6 +2221,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );
@@ -2050,6 +2290,7 @@ mod tests {
                 household: Household::default(),
                 spotify: SpotifyConfig::default(),
                 cadora: CadoraConfig::default(),
+                system1: System1Runtime::default(),
             },
             Some(path.clone()),
         );

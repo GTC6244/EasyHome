@@ -309,6 +309,25 @@ predictable memory use and no GC pauses under the 1 GB limit.
   `transcript` events on the same socket. The device streams continuously and runs
   no VAD; **the Anamanti Core detects end-of-speech** (energy VAD over the PCM) and
   sends `audio-stop` to the STT server, which then returns the final transcript.
+- **STREAMING → (optional) System-1 fast decision:** once the transcript is final, an
+  **optional pluggable System-1 decision engine** may run on the Anamanti Core *before* THINKING
+  (before memory recall and the LLM). It scores a fixed routing question set in a single
+  non-autoregressive forward pass and either **Resolves** a common intent or **Defers**:
+  - **Resolve** (confident, closed intent): drive the matching **existing `DeviceAction`** and
+    speak a short templated line via Piper, then finish the turn — **skipping memory recall and the
+    LLM entirely**. Implemented intents: **weather** (Open-Meteo → `DeviceAction::ShowWeather`, so
+    the widget opens *before* speech) and **timer** (a conservative duration parser →
+    `DeviceAction::StartTimer`; cancels/free-form defer). Resolved replies are **not**
+    wake-word-interruptible in v1 (sub-second line). Chat-log write, inferred memory, and the
+    follow-up `listen` window still happen (the fast path shares `emit_follow_up_and_stop` with the
+    normal reply path). Because the engine is a *typed classifier* (intent label, no free-form
+    slots), only intents with defaulted/parseable arguments are eligible; the rest defer.
+  - **Defer** (ambiguous, open-ended, low confidence, disabled, or error): fall through to THINKING
+    unchanged.
+  The engine is pluggable behind a trait (like the LLM) and shares the `/v1/systemone` wire
+  contract, so a local **`laya-serve`** sidecar (default) or **Jev/OpenRouter** (cloud fallback)
+  are swappable from config. Default is off (`system1.backend = none`), reproducing today's flow.
+  Full design: [`system1-fast-decisions.md`](./system1-fast-decisions.md).
 - **THINKING** — STT final transcript handed to the LLM backend (which
   consults persistent memory); reply tokens stream back and render.
 - **THINKING → SPEAKING (streaming TTS):** the Anamanti Core does **not** buffer the
@@ -586,6 +605,7 @@ frames already have).
 | Multiple displays share one Anamanti Core | Per-connection reply routing already isolates devices; one shared household memory/settings pool (speaker ID scopes per person) |
 | openWakeWord via tract-onnx | Pre-trained models, minimal deps, offline |
 | Pluggable LLM behind a trait | Swap local/cloud without touching the pipeline |
+| Optional System-1 fast-decision stage (pluggable, before recall+LLM) | Resolves common intents in one non-autoregressive forward pass, skipping the blocking embedding recall and the rig+tools full-completion; defers hard turns to System-2. Same trait pattern as the LLM; shared `/v1/systemone` contract serves local `laya-serve` (default) or Jev/OpenRouter (fallback); default off. See [`system1-fast-decisions.md`](./system1-fast-decisions.md) |
 | Rust-side playback | One audio layer, symmetric with capture |
 | Wake-word barge-in (flush-on-wake + `anamanti-interrupt`) | Natural interruption without full-duplex complexity; in-app AEC deferred, but a **required device-side HAL AEC shim** delivers echo cancellation on Echo Show 8 gen-1 (see §4) |
 | Streaming sentence-chunked TTS | First-audio at first-sentence latency, not full-reply; coalesced to one device audio stream |

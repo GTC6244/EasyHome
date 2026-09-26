@@ -1,0 +1,15 @@
+# Pin the Rust toolchain for reproducible builds.
+#
+# The Anamanti Core depends on the embedded HelixDB stack (foyer 0.22, crc-fast,
+# roaring, ordered-float), whose crates require rustc >= 1.91. The machine default was
+# 1.88, which fails dependency resolution ("rustc 1.88.0 is not supported by …").
+# Pinning here makes `cargo build/clippy/test` pick a compatible toolchain automatically
+# (rustup installs it on first use).
+#
+# Note: rustup resolves this file from the current directory upward, so it applies to
+# every cargo invocation in the repo — including the anamanti-display device build via
+# cargokit. A newer rustc is compatible with the Android armv7 cross-compile; the AGP /
+# Gradle / NDK pins in anamanti-display/android are unaffected (they are not rustc).
+[toolchain]
+channel = "1.92"
+components = ["clippy", "rustfmt"]

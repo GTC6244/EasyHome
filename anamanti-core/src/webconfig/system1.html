@@ -1,0 +1,82 @@
+<p class="sub">System-1 fast decisions: a pluggable engine that resolves common intents (weather, timers) before the LLM — skipping memory recall and the tool-calling completion. Changes apply live (no restart) and persist. Default <code>none</code> = disabled.</p>
+
+<div class="card">
+  <h2>Decision engine</h2>
+  <p class="desc">Pick the backend. <code>laya-serve</code> talks to a local Laya-Decision sidecar (<code>/v1/systemone</code>); <code>jev</code> uses OpenRouter (<code>typesafe/jev-1.13</code>). Both are typed classifiers — they route intents, they don't extract free-form arguments, so only intents with defaulted/parseable arguments resolve here; everything else falls through to the LLM.</p>
+  <p class="desc" id="statusline">Loading…</p>
+
+  <label>Backend
+    <select id="backend">
+      <option value="none">none (disabled)</option>
+      <option value="laya-serve">laya-serve (local sidecar)</option>
+      <option value="jev">jev (OpenRouter)</option>
+    </select>
+  </label>
+
+  <label>Base URL <span class="hint">laya-serve host, or the OpenRouter API root for jev</span>
+    <input id="base_url" type="text" placeholder="http://127.0.0.1:8000" autocomplete="off">
+  </label>
+
+  <label id="model_row">Model <span class="hint">jev only (OpenRouter model id)</span>
+    <input id="model" type="text" placeholder="typesafe/jev-1.13" autocomplete="off">
+  </label>
+
+  <label>Min confidence <span class="hint">0–1; below this the turn defers to the LLM</span>
+    <input id="min_confidence" type="number" min="0" max="1" step="0.01" placeholder="0.85">
+  </label>
+
+  <label id="key_row">OpenRouter API key <span class="hint" id="key_state"></span>
+    <input id="openrouter_api_key" type="password" placeholder="(leave blank to keep current)" autocomplete="off">
+  </label>
+
+  <div class="card-actions">
+    <div id="status" class="status"></div>
+    <button id="save" class="primary">Apply</button>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  function show(ok, msg){ statusEl.textContent = msg; statusEl.className = 'status ' + (ok?'ok':'err'); }
+  async function apiJSON(url, opts){ const r = await fetch(url, opts); return r.json(); }
+  function syncRows(){
+    const jev = $('backend').value === 'jev';
+    const off = $('backend').value === 'none';
+    $('model_row').style.display = jev ? '' : 'none';
+    $('key_row').style.display = jev ? '' : 'none';
+    $('base_url').closest('label').style.display = off ? 'none' : '';
+    $('min_confidence').closest('label').style.display = off ? 'none' : '';
+  }
+  async function load(){
+    try{
+      const j = await apiJSON('/system1/status.json');
+      $('backend').value = j.backend || 'none';
+      $('base_url').value = j.base_url || '';
+      $('model').value = j.model || '';
+      $('min_confidence').value = (j.min_confidence ?? 0.85);
+      $('openrouter_api_key').value = '';
+      $('key_state').textContent = j.openrouter_key_set ? '(a key is set)' : '(no key set)';
+      $('statusline').textContent = 'engine: ' + (j.active ? (j.backend + ' — active ✓') : 'disabled');
+      syncRows();
+    }catch(e){ show(false, 'Could not load status: ' + e); }
+  }
+  async function save(){
+    const body = {
+      backend: $('backend').value,
+      base_url: $('base_url').value.trim() || undefined,
+      model: $('model').value.trim() || undefined,
+      min_confidence: parseFloat($('min_confidence').value),
+      openrouter_api_key: $('openrouter_api_key').value.trim() || undefined,
+    };
+    if (Number.isNaN(body.min_confidence)) delete body.min_confidence;
+    try{
+      const j = await apiJSON('/system1/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+      if(j.ok === false){ show(false, j.message || 'Rejected.'); } else { show(true, 'Applied.'); }
+      load();
+    }catch(e){ show(false, 'Request failed: ' + e); }
+  }
+  $('backend').addEventListener('change', syncRows);
+  $('save').addEventListener('click', save);
+  load();
+</script>

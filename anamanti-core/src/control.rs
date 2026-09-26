@@ -482,6 +482,7 @@ mod tests {
                 household: crate::settings::Household::default(),
                 spotify: crate::settings::SpotifyConfig::default(),
                 cadora: crate::settings::CadoraConfig::default(),
+                system1: crate::settings::System1Runtime::default(),
             },
         );
         let mem = MemoryStore::open_in_memory().unwrap();

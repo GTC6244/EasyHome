@@ -144,6 +144,8 @@ pub struct Config {
     pub music: MusicConfig,
     /// Weather feature settings (the `weather_lookup` tool + the ambient push).
     pub weather: WeatherSettings,
+    /// System-1 fast-decision engine selection (plans/system1-fast-decisions.md).
+    pub system1: System1Config,
     /// Where the runtime-swappable settings overlay is persisted (`settings_path` in
     /// the config file), or `None` to keep runtime settings in memory only. Defaults
     /// to `anamanti_settings.json`. This is a **separate** file from the boot config:
@@ -414,6 +416,43 @@ impl WeatherSettings {
     }
 }
 
+/// System-1 fast-decision settings (plans/system1-fast-decisions.md). Selects and
+/// configures the pluggable [`crate::system1::DecisionEngine`] that runs before memory
+/// recall + the LLM. Default `backend = "none"` reproduces today's behavior.
+#[derive(Debug, Clone)]
+pub struct System1Config {
+    /// Which engine: `none` (default, disabled) | `mock` (tests) | `laya-serve` | `jev`
+    /// | `laya-embedded`. The HTTP/embedded backends are wired in M1.
+    pub backend: String,
+    /// Base URL for the HTTP backends (`laya-serve` sidecar or OpenRouter for `jev`).
+    pub base_url: String,
+    /// OpenRouter model id for the `jev` backend.
+    pub openrouter_model: String,
+    /// Compute device for the in-process `laya-embedded` backend (`cpu` | `metal`).
+    pub device: String,
+    /// Checkpoint / Hugging Face repo id for the `laya-embedded` backend.
+    pub model: String,
+    /// Strict confidence floor below which a decision defers to System-2.
+    pub min_confidence: f64,
+    /// The intent labels the router is allowed to resolve (empty = the built-in set,
+    /// filled in as M1+ handlers land).
+    pub intents: Vec<String>,
+}
+
+impl Default for System1Config {
+    fn default() -> Self {
+        Self {
+            backend: "none".to_string(),
+            base_url: "http://127.0.0.1:8000".to_string(),
+            openrouter_model: "typesafe/jev-1.13".to_string(),
+            device: "metal".to_string(),
+            model: "convaiinnovations/laya".to_string(),
+            min_confidence: 0.85,
+            intents: Vec::new(),
+        }
+    }
+}
+
 /// Which memory retrieval backend the pipeline uses for prompt context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryBackendChoice {
@@ -491,6 +530,7 @@ impl Default for Config {
             follow_up: FollowUpConfig::default(),
             music: MusicConfig::default(),
             weather: WeatherSettings::default(),
+            system1: System1Config::default(),
             settings_path: Some(PathBuf::from("anamanti_settings.json")),
             audio_dump_dir: None,
             anthropic_auth: AnthropicAuth::ApiKey,
@@ -598,6 +638,8 @@ pub struct FileConfig {
     pub music: FileMusic,
     #[serde(default)]
     pub weather: FileWeather,
+    #[serde(default)]
+    pub system1: FileSystem1,
     #[serde(default)]
     pub calendar: FileCalendar,
     #[serde(default)]
@@ -719,6 +761,21 @@ pub struct FileMusic {
 pub struct FileWeather {
     pub enabled: Option<bool>,
     pub refresh_interval_secs: Option<u64>,
+}
+
+/// The `system1` block of the config file (all fields optional; absent → defaults, and
+/// an absent block leaves the engine disabled). See [`System1Config`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSystem1 {
+    pub backend: Option<String>,
+    pub base_url: Option<String>,
+    pub openrouter_model: Option<String>,
+    pub device: Option<String>,
+    pub model: Option<String>,
+    pub min_confidence: Option<f64>,
+    #[serde(default)]
+    pub intents: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -993,6 +1050,22 @@ impl Config {
                 .unwrap_or(wd.refresh_interval_secs),
         };
 
+        let s1d = System1Config::default();
+        let system1 = System1Config {
+            backend: nonempty(fc.system1.backend).unwrap_or(s1d.backend),
+            base_url: nonempty(fc.system1.base_url).unwrap_or(s1d.base_url),
+            openrouter_model: nonempty(fc.system1.openrouter_model)
+                .unwrap_or(s1d.openrouter_model),
+            device: nonempty(fc.system1.device).unwrap_or(s1d.device),
+            model: nonempty(fc.system1.model).unwrap_or(s1d.model),
+            min_confidence: fc.system1.min_confidence.unwrap_or(s1d.min_confidence),
+            intents: if fc.system1.intents.is_empty() {
+                s1d.intents
+            } else {
+                fc.system1.intents
+            },
+        };
+
         // The config page: `off`/`none`/empty disables it, otherwise a host:port.
         let config_addr = match fc.config_addr {
             None => d.config_addr,
@@ -1106,6 +1179,7 @@ impl Config {
             follow_up,
             music,
             weather,
+            system1,
             settings_path,
             audio_dump_dir: fc.audio_dump_dir,
             anthropic_auth: fc
@@ -1137,6 +1211,31 @@ impl Config {
             spotify,
             cadora,
         })
+    }
+
+    /// Build the selected System-1 decision engine (plans/system1-fast-decisions.md),
+    /// mirroring [`Config::build_llm`]. Default `none` reproduces today's behavior.
+    ///
+    /// Build the System-1 engine straight from the config file's `system1` block (the
+    /// OpenRouter key comes from the `OPENROUTER_API_KEY` env secret). The live boot path
+    /// is [`Self::shared_settings`], which also applies the persisted overlay and makes
+    /// the engine runtime-swappable; this helper is kept for direct/one-shot use.
+    pub fn build_system1(&self) -> Result<Arc<dyn crate::system1::DecisionEngine>> {
+        let key = env::var("OPENROUTER_API_KEY").ok().filter(|s| !s.is_empty());
+        if self.system1.backend.eq_ignore_ascii_case("jev") && key.is_none() {
+            log::warn!(
+                "system1.backend=jev but OPENROUTER_API_KEY is unset; Jev requests will be \
+                 rejected until it is provided (env or config page)."
+            );
+        }
+        crate::system1::build(
+            &self.system1.backend,
+            &self.system1.base_url,
+            &self.system1.openrouter_model,
+            key,
+            self.system1.min_confidence,
+            self.system1.intents.clone(),
+        )
     }
 
     /// Build the music ducker when music routing **and** duck-on-speech are both
@@ -1458,6 +1557,14 @@ impl Config {
         let mut spotify = self.initial_spotify();
         // Cadora shopping-list config: same seed-then-persist-overlay pattern.
         let mut cadora = self.initial_cadora();
+        // System-1 fast-decision selection: config-file seed, overlaid by persisted
+        // values below. The OpenRouter key is an env secret seed (like the other keys).
+        let mut system1_backend = self.system1.backend.clone();
+        let mut system1_base_url = self.system1.base_url.clone();
+        let mut system1_model = self.system1.openrouter_model.clone();
+        let mut system1_min_confidence = self.system1.min_confidence;
+        let mut system1_intents = self.system1.intents.clone();
+        let mut openrouter_api_key = env::var("OPENROUTER_API_KEY").ok().filter(|s| !s.is_empty());
 
         if let Some(p) = persist_path.as_deref().and_then(load_persisted) {
             log::info!("loaded persisted settings");
@@ -1546,6 +1653,20 @@ impl Config {
             if p.cadora.link_token.is_some() {
                 cadora.link_token = p.cadora.link_token;
             }
+            // Overlay persisted System-1 selection onto the config-file seed. Only when
+            // the persisted backend is non-empty (a real save), so an older settings
+            // file — which lacks these fields (serde default "") — can't disable a
+            // `system1.backend` set in anamanti.json.
+            if !p.system1_backend.is_empty() {
+                system1_backend = p.system1_backend;
+                system1_base_url = p.system1_base_url;
+                system1_model = p.system1_model;
+                system1_min_confidence = p.system1_min_confidence;
+                system1_intents = p.system1_intents;
+            }
+            if p.openrouter_api_key.is_some() {
+                openrouter_api_key = p.openrouter_api_key;
+            }
         }
 
         // Seed the directions tool's live default origin from the resolved household
@@ -1589,6 +1710,22 @@ impl Config {
                 anthropic_auth,
             )
             .context("building the initial LLM backend")?;
+        // Build the initial System-1 engine from the resolved (seed → persisted) config.
+        if system1_backend.eq_ignore_ascii_case("jev") && openrouter_api_key.is_none() {
+            log::warn!(
+                "system1.backend=jev but OPENROUTER_API_KEY is unset; Jev requests will be \
+                 rejected until it is provided (env or config page)."
+            );
+        }
+        let system1 = crate::system1::build(
+            &system1_backend,
+            &system1_base_url,
+            &system1_model,
+            openrouter_api_key.clone(),
+            system1_min_confidence,
+            system1_intents.clone(),
+        )
+        .context("building the initial System-1 engine")?;
         Ok(SharedSettings::new_persistent(
             factory,
             RuntimeSettings {
@@ -1611,6 +1748,15 @@ impl Config {
                 household,
                 spotify,
                 cadora,
+                system1: crate::settings::System1Runtime {
+                    engine: system1,
+                    backend: system1_backend,
+                    base_url: system1_base_url,
+                    model: system1_model,
+                    min_confidence: system1_min_confidence,
+                    intents: system1_intents,
+                    openrouter_api_key,
+                },
             },
             persist_path,
         ))

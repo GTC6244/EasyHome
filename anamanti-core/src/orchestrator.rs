@@ -143,6 +143,10 @@ pub struct Pipeline {
     /// reopen the mic (no wake word) and feed recent history into that turn's prompt.
     /// Defaults to [`FollowUpConfig::default`] (enabled) until `with_follow_up` sets it.
     follow_up: FollowUpConfig,
+    /// Forecast provider for the System-1 `weather` fast path (keyless Open-Meteo),
+    /// shared with the ambient push. `None` when weather is disabled — the weather
+    /// intent then defers to System-2. Set via `with_weather`.
+    weather: Option<Arc<dyn crate::weather::WeatherProvider>>,
     /// STT engine used to transcribe each turn. `None` keeps the historical path:
     /// dial the downstream Wyoming Whisper server via the per-turn
     /// [`ServiceConnector`]. `Some` (e.g. the in-process whisper.cpp engine) supplies
@@ -172,6 +176,7 @@ impl Pipeline {
             system_prompt: system_prompt.into(),
             turn_timeout,
             follow_up: FollowUpConfig::default(),
+            weather: None,
             stt_engine: None,
         }
     }
@@ -215,6 +220,23 @@ impl Pipeline {
     /// this the pipeline uses [`FollowUpConfig::default`] (enabled).
     pub fn with_follow_up(mut self, follow_up: FollowUpConfig) -> Self {
         self.follow_up = follow_up;
+        self
+    }
+
+    /// Install a System-1 fast-decision engine (plans/system1-fast-decisions.md) into the
+    /// live settings, so the per-turn snapshot picks it up. The boot path builds the
+    /// engine from config in [`SharedSettings`]; this is a convenience for tests and
+    /// callers holding an already-built engine. The config page swaps it at runtime via
+    /// [`SharedSettings::apply_system1`].
+    pub fn with_system1(self, system1: Arc<dyn crate::system1::DecisionEngine>) -> Self {
+        self.settings.set_system1(system1);
+        self
+    }
+
+    /// Provide the forecast provider used by the System-1 `weather` fast path (shared
+    /// with the ambient push). Without it, the weather intent defers to System-2.
+    pub fn with_weather(mut self, weather: Option<Arc<dyn crate::weather::WeatherProvider>>) -> Self {
+        self.weather = weather;
         self
     }
 
@@ -651,6 +673,59 @@ impl Pipeline {
             return Ok((reply, memories_written));
         }
 
+        // System-1 fast-decision fork (plans/system1-fast-decisions.md; Plan.MD
+        // 2026-09-25). Runs *before* memory recall + the LLM. Skipped entirely for the
+        // default `none` engine, so ordinary builds are unaffected. On a confident
+        // Resolve with a matching handler, the turn is answered here — skipping the
+        // GraphRAG embedding round-trip (#3) and the rig+tools full completion (#1) —
+        // and returns; otherwise it falls through to System-2 below.
+        if runtime.system1.engine.name() != "none" {
+            let req = crate::system1::DecisionRequest {
+                transcript: transcript.to_string(),
+                screen: None,        // M1: derive a label from the turn's `screen` context
+                history: Vec::new(), // M1: recent turns for follow-up disambiguation
+                // Home location grounds location-dependent intents (weather): the HTTP
+                // engine retries an otherwise-deferred turn with this folded into the query.
+                location: self.settings.home_location().get(),
+            };
+            match runtime.system1.engine.decide(&req).await {
+                Ok(crate::system1::Decision::Resolve(r)) => {
+                    log::info!(
+                        "system1 ({}) resolved intent `{}` (conf {:.2})",
+                        runtime.system1.engine.name(),
+                        r.intent,
+                        r.confidence,
+                    );
+                    if let Some(reply) = self
+                        .handle_system1_intent(
+                            &r,
+                            runtime,
+                            transcript,
+                            device,
+                            connector,
+                            followup_depth,
+                            on_event,
+                            dump,
+                        )
+                        .await
+                    {
+                        // Fully handled on the fast path (widget + spoken reply +
+                        // follow-up). The caller still logs the turn to the chat log.
+                        return Ok((reply, memories_written));
+                    }
+                    log::debug!(
+                        "system1 intent `{}` not handled on the fast path; deferring to System-2",
+                        r.intent
+                    );
+                }
+                Ok(crate::system1::Decision::Defer) => {}
+                Err(e) => log::debug!(
+                    "system1 ({}) decide failed ({e:#}); deferring to System-2",
+                    runtime.system1.engine.name()
+                ),
+            }
+        }
+
         // Inferred capture from an ordinary turn — attributed to this speaker.
         for (kind, content) in infer_memories(transcript) {
             self.memory
@@ -806,39 +881,18 @@ impl Pipeline {
                     self.speak_chunk(writer, runtime, connector, &rest, &mut audio_started, dump)
                         .await?;
                 }
-                // Follow-up listen: after EVERY reply, ask the device to reopen the mic
-                // (no wake word) for more input, then sleep if none comes. The listen
-                // window is longer after a question (`question_wait_secs`) than after a
-                // plain reply (`reply_wait_secs`); the device echoes it back so this
-                // orchestrator sizes the follow-up turn's no-speech window to match.
-                // This MUST be sent before the final `audio-stop` — the device ends its
-                // turn on the first `audio-stop`, so a frame after it would arrive on a
-                // closing socket. `max_chain` (0 = unlimited) is an optional safety
-                // ceiling; the loop normally ends on silence. Reaching here means the
-                // reply completed (a barge-in would have dropped this whole future), so
-                // we never reopen over an interruption.
-                let within_cap =
-                    self.follow_up.max_chain == 0 || followup_depth < self.follow_up.max_chain;
-                if self.follow_up.enabled && audio_started && within_cap {
-                    let next_depth = followup_depth + 1;
-                    let wait_secs = if reply_is_question(&reply) {
-                        self.follow_up.question_wait_secs
-                    } else {
-                        self.follow_up.reply_wait_secs
-                    };
-                    log::info!(
-                        "follow-up: asking device to listen for {wait_secs}s (depth {next_depth})"
-                    );
-                    protocol::write_event(writer, &WyomingEvent::listen(next_depth, wait_secs))
-                        .await
-                        .ok();
-                }
-                // Close the single coalesced device-facing audio stream.
-                if audio_started {
-                    protocol::write_event(writer, &WyomingEvent::audio_stop(0))
-                        .await
-                        .ok();
-                }
+                // Follow-up listen (after EVERY reply) + the final `audio-stop`. Shared
+                // with the System-1 fast path via `emit_follow_up_and_stop`. Reaching
+                // here means the reply completed (a barge-in would have dropped this
+                // whole future), so we never reopen over an interruption.
+                emit_follow_up_and_stop(
+                    writer,
+                    &self.follow_up,
+                    audio_started,
+                    &reply,
+                    followup_depth,
+                )
+                .await;
                 Ok(())
             };
             tokio::pin!(drive);
@@ -1040,6 +1094,153 @@ impl Pipeline {
     /// stop (e.g. the Phase-3 client that ends on transcript, or a barge-in that
     /// dropped the socket), not a turn failure — and `Ok(true)` otherwise. An
     /// empty/whitespace chunk is a no-op that returns `Ok(true)`.
+    /// Dispatch a System-1 [`Resolution`](crate::system1::Resolution) to its handler.
+    /// Returns `Some(reply)` when the turn was fully answered on the fast path (so the
+    /// caller returns without touching recall/the LLM), or `None` to defer to System-2
+    /// (unknown intent, or a handler precondition that failed *before* anything was sent
+    /// to the device — so deferring can't double-speak).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_system1_intent(
+        &self,
+        r: &crate::system1::Resolution,
+        runtime: &crate::settings::RuntimeSettings,
+        _transcript: &str,
+        device: &mut DynConnection,
+        connector: &dyn ServiceConnector,
+        followup_depth: u32,
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        dump: Option<&TurnAudioDump>,
+    ) -> Option<String> {
+        match r.intent.as_str() {
+            "weather" => {
+                self.handle_weather(runtime, device, connector, followup_depth, on_event, dump)
+                    .await
+            }
+            "timer" => {
+                self.handle_timer(
+                    runtime,
+                    _transcript,
+                    device,
+                    connector,
+                    followup_depth,
+                    on_event,
+                    dump,
+                )
+                .await
+            }
+            _ => None, // no fast-path handler yet → defer
+        }
+    }
+
+    /// The System-1 `timer` fast path: parse an unambiguous duration from the transcript,
+    /// start the timer on the device, and speak a confirmation — skipping the LLM. Returns
+    /// `None` (defer) when no clear duration is present (e.g. "cancel my timer", or a
+    /// free-form request), so the robust System-2 timer tool still handles those.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_timer(
+        &self,
+        runtime: &crate::settings::RuntimeSettings,
+        transcript: &str,
+        device: &mut DynConnection,
+        connector: &dyn ServiceConnector,
+        followup_depth: u32,
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        dump: Option<&TurnAudioDump>,
+    ) -> Option<String> {
+        let secs = crate::system1::parse_duration_secs(transcript)?; // unclear → defer
+        // Guard rails: ignore absurd durations (>24h) — defer to System-2.
+        if secs == 0 || secs > 24 * 3600 {
+            log::debug!("system1 timer: duration {secs}s out of range; deferring to System-2");
+            return None;
+        }
+
+        // Committed: own the turn from here (never fall through → no double-speak).
+        let reply = format!("Timer set for {}.", human_duration(secs));
+        let (_reader, writer) = device.split_mut();
+        protocol::write_event(writer, &WyomingEvent::timer_start(secs, None))
+            .await
+            .ok();
+        on_event(TurnEvent::ReplyToken(reply.clone()));
+        protocol::write_event(writer, &WyomingEvent::reply_token(&reply))
+            .await
+            .ok();
+        on_event(TurnEvent::Speaking);
+        let mut audio_started = false;
+        if let Err(e) = self
+            .speak_chunk(writer, runtime, connector, &reply, &mut audio_started, dump)
+            .await
+        {
+            log::warn!("system1 timer: TTS failed ({e:#}); timer started, text still sent");
+        }
+        emit_follow_up_and_stop(writer, &self.follow_up, audio_started, &reply, followup_depth)
+            .await;
+        Some(reply)
+    }
+
+    /// The System-1 `weather` fast path: fetch the forecast (keyless Open-Meteo), open
+    /// the full-screen weather widget *before* speaking, then speak a short templated
+    /// summary and invite a follow-up. Skips memory recall + the LLM entirely. Returns
+    /// `None` (defer) only on a precondition that fails before anything is emitted (no
+    /// provider, no home location, or the fetch errors).
+    async fn handle_weather(
+        &self,
+        runtime: &crate::settings::RuntimeSettings,
+        device: &mut DynConnection,
+        connector: &dyn ServiceConnector,
+        followup_depth: u32,
+        on_event: &mut (dyn FnMut(TurnEvent) + Send),
+        dump: Option<&TurnAudioDump>,
+    ) -> Option<String> {
+        let provider = self.weather.as_ref()?; // weather disabled → defer
+        let location = runtime
+            .household
+            .location
+            .clone()
+            .unwrap_or_default();
+        if location.trim().is_empty() {
+            log::debug!("system1 weather: no home location configured; deferring to System-2");
+            return None;
+        }
+        let imperial =
+            crate::directions::units_are_imperial(runtime.household.weather_units.as_deref());
+        let report = match provider.fetch(&location, imperial).await {
+            Ok(report) => report,
+            Err(e) => {
+                log::warn!("system1 weather fetch failed ({e:#}); deferring to System-2");
+                return None; // nothing emitted yet — safe to defer
+            }
+        };
+
+        // Committed: from here we own the turn and must not fall through (that would
+        // double-speak). Best-effort writes mirror the normal reply path.
+        let reply = weather_summary(&report);
+        let (_reader, writer) = device.split_mut();
+        // Widget first, so the screen changes the instant the intent resolves.
+        protocol::write_event(
+            writer,
+            &WyomingEvent::weather_show(
+                serde_json::to_value(&report).unwrap_or(serde_json::Value::Null),
+            ),
+        )
+        .await
+        .ok();
+        on_event(TurnEvent::ReplyToken(reply.clone()));
+        protocol::write_event(writer, &WyomingEvent::reply_token(&reply))
+            .await
+            .ok();
+        on_event(TurnEvent::Speaking);
+        let mut audio_started = false;
+        if let Err(e) = self
+            .speak_chunk(writer, runtime, connector, &reply, &mut audio_started, dump)
+            .await
+        {
+            log::warn!("system1 weather: TTS failed ({e:#}); widget + text still sent");
+        }
+        emit_follow_up_and_stop(writer, &self.follow_up, audio_started, &reply, followup_depth)
+            .await;
+        Some(reply)
+    }
+
     async fn speak_chunk(
         &self,
         writer: &mut DynWrite,
@@ -1420,6 +1621,92 @@ fn recipe_screen_line(screen: &protocol::RecipeScreen) -> String {
 /// only takes actions already queued (a tool's `invoke` runs synchronously during
 /// the LLM turn, so its action is enqueued before we get here). Write failures are
 /// swallowed — the device dropping mid-turn is handled by the surrounding turn logic.
+/// Close out a spoken turn: send the follow-up `anamanti-listen` frame (when enabled,
+/// audio was produced, and the chain cap allows it) **before** the final `audio-stop`
+/// (the device ends its turn on the first stop). Shared by the normal reply path and the
+/// System-1 fast path so both invite follow-ups identically.
+async fn emit_follow_up_and_stop<W>(
+    writer: &mut W,
+    follow_up: &FollowUpConfig,
+    audio_started: bool,
+    reply: &str,
+    followup_depth: u32,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let within_cap = follow_up.max_chain == 0 || followup_depth < follow_up.max_chain;
+    if follow_up.enabled && audio_started && within_cap {
+        let next_depth = followup_depth + 1;
+        let wait_secs = if reply_is_question(reply) {
+            follow_up.question_wait_secs
+        } else {
+            follow_up.reply_wait_secs
+        };
+        log::info!("follow-up: asking device to listen for {wait_secs}s (depth {next_depth})");
+        protocol::write_event(writer, &WyomingEvent::listen(next_depth, wait_secs))
+            .await
+            .ok();
+    }
+    // Close the single coalesced device-facing audio stream.
+    if audio_started {
+        protocol::write_event(writer, &WyomingEvent::audio_stop(0))
+            .await
+            .ok();
+    }
+}
+
+/// A speakable duration, e.g. `600` → "10 minutes", `5400` → "1 hour 30 minutes",
+/// `90` → "1 minute 30 seconds". Used in the System-1 timer confirmation.
+fn human_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    let mut parts = Vec::new();
+    let unit = |n: u64, singular: &str| {
+        if n == 1 {
+            format!("1 {singular}")
+        } else {
+            format!("{n} {singular}s")
+        }
+    };
+    if h > 0 {
+        parts.push(unit(h, "hour"));
+    }
+    if m > 0 {
+        parts.push(unit(m, "minute"));
+    }
+    if s > 0 {
+        parts.push(unit(s, "second"));
+    }
+    if parts.is_empty() {
+        return "0 seconds".to_string();
+    }
+    parts.join(" ")
+}
+
+/// A short, speakable one-line summary of a forecast for the System-1 weather fast path
+/// (the full detail is on the widget). Metric/imperial follows the report's units.
+fn weather_summary(report: &crate::weather::WeatherReport) -> String {
+    let deg = if report.units == "imperial" {
+        "°F"
+    } else {
+        "°C"
+    };
+    let c = &report.current;
+    let lead = {
+        let d = c.description.trim();
+        if d.is_empty() {
+            String::new()
+        } else {
+            format!("{d}, ")
+        }
+    };
+    format!(
+        "{lead}it's {}{deg} in {}. Today's high is {}{deg}, low {}{deg}.",
+        c.temp, report.location_label, c.high, c.low
+    )
+}
+
 async fn drain_device_actions<W>(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<DeviceAction>,
     writer: &mut W,

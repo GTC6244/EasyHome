@@ -1118,3 +1118,126 @@ async fn explicit_remember_command_short_circuits_the_llm() {
     assert_eq!(stored[0].content, "I like my coffee black");
     assert_eq!(stored[0].kind, MemoryKind::Preference);
 }
+
+/// System-1 fast path: when the decision engine resolves the `weather` intent, the
+/// pipeline fetches the forecast, shows the full-screen weather widget, and speaks a
+/// templated summary — **without** ever calling the LLM (System-2). A panicking LLM
+/// backend proves the LLM is skipped. (plans/system1-fast-decisions.md, M1)
+#[tokio::test]
+async fn system1_weather_resolve_shows_widget_and_skips_the_llm() {
+    use anamanti_core::settings::Household;
+    use anamanti_core::system1::mock::MockDecider;
+    use anamanti_core::weather::{CurrentConditions, WeatherProvider, WeatherReport};
+
+    // Reaching System-2 on a resolved weather turn is a bug — panic loudly if it does.
+    struct PanicLlm;
+    #[async_trait]
+    impl LlmBackend for PanicLlm {
+        fn name(&self) -> &str {
+            "panic"
+        }
+        async fn respond(&self, _turn: LlmTurn) -> Result<ReplyStream> {
+            panic!("System-2 LLM must not run when System-1 resolves the weather intent");
+        }
+    }
+
+    struct FakeWeather;
+    #[async_trait]
+    impl WeatherProvider for FakeWeather {
+        async fn fetch(&self, location: &str, imperial: bool) -> Result<WeatherReport> {
+            Ok(WeatherReport {
+                location_label: location.to_string(),
+                units: if imperial { "imperial".into() } else { "metric".into() },
+                current: CurrentConditions {
+                    temp: 18,
+                    feels_like: 17,
+                    weather_code: 3,
+                    is_day: true,
+                    high: 21,
+                    low: 12,
+                    description: "Partly cloudy".into(),
+                },
+                daily: Vec::new(),
+            })
+        }
+    }
+
+    let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+    let pipeline = Pipeline::new(
+        Arc::new(PanicLlm),
+        memory,
+        "test persona",
+        None,
+        Duration::from_secs(5),
+    )
+    .with_system1(Arc::new(MockDecider::resolve("weather", 0.99)))
+    .with_weather(Some(Arc::new(FakeWeather)));
+
+    // The weather fast path needs a home location; set it on the live settings.
+    let hh = Household {
+        location: Some("Austin, Texas".to_string()),
+        weather_units: Some("imperial".to_string()),
+        members: Vec::new(),
+    };
+    pipeline.settings().apply_household(&hh);
+
+    let connector = MockConnector::new("what's the weather");
+    let ((transcript, reply, kinds), _events) = run_one_turn(&pipeline, &connector).await;
+
+    assert_eq!(transcript, "what's the weather");
+    // The device was shown the full-screen weather widget.
+    assert!(
+        kinds.iter().any(|k| k == types::WEATHER),
+        "expected an anamanti-weather frame, got {kinds:?}"
+    );
+    // The spoken reply is the templated forecast (a System-2 reply would not name the
+    // location/high, and PanicLlm would have panicked).
+    assert!(reply.contains("Austin, Texas"), "reply was: {reply:?}");
+    assert!(reply.contains("high"), "reply was: {reply:?}");
+    // Exactly the summary was synthesized by Piper.
+    let synths = connector.synthesized.lock().unwrap().clone();
+    assert_eq!(synths.len(), 1, "one TTS chunk, got {synths:?}");
+    assert!(synths[0].contains("Austin, Texas"));
+    // A well-formed turn ends with a single coalesced audio-stop.
+    assert_eq!(kinds.last().map(String::as_str), Some(types::AUDIO_STOP));
+}
+
+/// System-1 fast path: a clear "set a timer for N" resolves on-device (a timer frame +
+/// spoken confirmation) without the LLM; an unclear timer request would defer. A
+/// panicking LLM proves System-2 is skipped. (plans/system1-fast-decisions.md, M3)
+#[tokio::test]
+async fn system1_timer_resolve_starts_timer_and_skips_the_llm() {
+    use anamanti_core::system1::mock::MockDecider;
+
+    struct PanicLlm;
+    #[async_trait]
+    impl LlmBackend for PanicLlm {
+        fn name(&self) -> &str {
+            "panic"
+        }
+        async fn respond(&self, _turn: LlmTurn) -> Result<ReplyStream> {
+            panic!("System-2 LLM must not run when System-1 resolves a clear timer");
+        }
+    }
+
+    let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+    let pipeline = Pipeline::new(
+        Arc::new(PanicLlm),
+        memory,
+        "test persona",
+        None,
+        Duration::from_secs(5),
+    )
+    .with_system1(Arc::new(MockDecider::resolve("timer", 0.99)));
+
+    let connector = MockConnector::new("set a timer for 10 minutes");
+    let ((transcript, reply, kinds), _events) = run_one_turn(&pipeline, &connector).await;
+
+    assert_eq!(transcript, "set a timer for 10 minutes");
+    assert!(
+        kinds.iter().any(|k| k == types::TIMER),
+        "expected an anamanti-timer frame, got {kinds:?}"
+    );
+    assert_eq!(reply, "Timer set for 10 minutes.");
+    assert_eq!(kinds.last().map(String::as_str), Some(types::AUDIO_STOP));
+}

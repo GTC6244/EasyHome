@@ -77,6 +77,7 @@ async fn start_server() -> (std::net::SocketAddr, Arc<MemoryStore>, Arc<SharedSe
             household: Household::default(),
             spotify: SpotifyConfig::default(),
             cadora: CadoraConfig::default(),
+            system1: anamanti_core::settings::System1Runtime::default(),
         },
     );
     let pipeline = Pipeline::with_settings(
