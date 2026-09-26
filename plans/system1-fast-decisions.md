@@ -452,12 +452,24 @@ These need a real sidecar / device and could not be exercised unattended:
    surfaces the error inline without changing the live engine. Confirm the model/key rows show only
    for `jev`.
 
-3. **Jev / OpenRouter.** Set `system1.backend="jev"`, `system1.base_url="https://openrouter.ai/api"`,
-   `OPENROUTER_API_KEY=...`. **The exact OpenRouter Decisions endpoint path + request envelope were
-   not verifiable here** (the tutorial fetch was blocked) — confirm `POST {base_url}/v1/systemone`
-   with `model: "typesafe/jev-1.13"` + bearer auth is correct, and adjust `HttpDecider`/`base_url` if
-   OpenRouter expects a different path (e.g. `/api/v1/...`). Watch for a 4xx in the Core log; any
-   error defers to System-2, so a misconfig degrades gracefully but silently.
+3. **Jev / OpenRouter. ✅ VERIFIED LIVE 2026-09-26.** Set `system1.backend="jev"`,
+   `system1.base_url="https://openrouter.ai/api"`, `OPENROUTER_API_KEY=...`. The endpoint is the
+   shared **System One** API: `POST https://openrouter.ai/api/v1/systemone` with `model:
+   "typesafe/jev-1.13"` + bearer auth — confirmed against the live server and OpenRouter's OpenAPI
+   spec (it is NOT the OpenAI chat-completions route). Two corrections landed from this verification:
+   - **Response fields.** A `choice` answer carries `choice` + **`confidence`** + `probabilities`; a
+     `noul` answer carries **only `noul`** (0..1), no confidence field. The parser previously read a
+     nonexistent `answer_confidence`, so every turn scored 0.0 and silently deferred. Fixed in
+     `system1/http.rs` (`choice_confidence` still falls back to `answer_confidence` for a laya-serve
+     build that emits the older field).
+   - **Weather needed a place.** Bare "what's the weather" scores `needs_full_understanding` noul
+     ~0.94 (defer); "what's the weather **in <place>**" scores ~0.30 (resolve). Putting the location
+     in a `state` field alone does **not** help (~0.87) — it must be in the question text. So the
+     HTTP engine now retries once: a confident but deferred [`LOCATION_INTENTS`] intent (weather) is
+     re-asked with the home location folded into the transcript. Two fast System One calls still beat
+     a System-2 turn. Home location comes from `DecisionRequest.location` (`LiveHomeLocation`).
+
+   Watch for a 4xx in the Core log; any error defers to System-2, so a misconfig degrades gracefully.
 
 4. **On-device (Echo Show).** Confirm: the weather widget opens **before** the spoken line; the
    timer starts and counts down; the follow-up mic reopens after the reply (the fast path shares

@@ -50,6 +50,7 @@ mod tests {
             transcript: t.to_string(),
             screen: None,
             history: Vec::new(),
+            location: None,
         }
     }
 

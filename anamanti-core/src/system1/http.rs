@@ -36,6 +36,13 @@ use super::{Decision, DecisionEngine, DecisionRequest, Resolution};
 /// The `noul` question id used to detect turns that need System-2 reasoning.
 const NEEDS_FULL: &str = "needs_full_understanding";
 
+/// Intents that are ambiguous without a place. When one of these is chosen confidently
+/// but the turn still defers (the model judged it "needs a location"), the engine retries
+/// once with the home location folded into the question — a second fast System One call,
+/// still far cheaper than a System-2 turn. Verified live: "what's the weather" defers
+/// (noul ~0.94) but "what's the weather in <place>" resolves (noul ~0.3).
+const LOCATION_INTENTS: &[&str] = &["weather"];
+
 /// An HTTP System-1 engine speaking `/v1/systemone`.
 pub struct HttpDecider {
     client: reqwest::Client,
@@ -116,7 +123,33 @@ impl DecisionEngine for HttpDecider {
 
     async fn decide(&self, req: &DecisionRequest) -> Result<Decision> {
         let body = build_request(&req.transcript, self.model.as_deref(), &self.intents);
-        let mut rb = self.client.post(&self.url).json(&body);
+        let value = self.post(&body).await?;
+        let decision = interpret(&value, &self.intents, self.min_confidence);
+        if matches!(decision, Decision::Resolve(_)) {
+            return Ok(decision);
+        }
+
+        // Escalate once: a confident, location-dependent intent (e.g. `weather`) that
+        // deferred usually just lacks a place. Retry with the home location folded into
+        // the question text — the model's `needs_full_understanding` noul then drops
+        // below the defer line. Two fast System One calls still beat a System-2 turn.
+        if let Some(loc) = req.location.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+            if confident_location_intent(&value, &self.intents, self.min_confidence).is_some() {
+                let augmented = format!("{} in {}", req.transcript.trim(), loc);
+                let body = build_request(&augmented, self.model.as_deref(), &self.intents);
+                let value = self.post(&body).await?;
+                return Ok(interpret(&value, &self.intents, self.min_confidence));
+            }
+        }
+        Ok(decision)
+    }
+}
+
+impl HttpDecider {
+    /// POST a `/v1/systemone` body and decode the JSON response, erroring on a non-2xx
+    /// status so the caller defers to System-2.
+    async fn post(&self, body: &Value) -> Result<Value> {
+        let mut rb = self.client.post(&self.url).json(body);
         if let Some(key) = &self.api_key {
             rb = rb.bearer_auth(key);
         }
@@ -129,7 +162,7 @@ impl DecisionEngine for HttpDecider {
         if !status.is_success() {
             anyhow::bail!("/v1/systemone returned {status}: {value}");
         }
-        Ok(interpret(&value, &self.intents, self.min_confidence))
+        Ok(value)
     }
 }
 
@@ -227,6 +260,27 @@ pub fn interpret(resp: &Value, intents: &[String], min_confidence: f64) -> Decis
     }
 }
 
+/// If the response confidently chose a location-dependent intent (in both
+/// [`LOCATION_INTENTS`] and this router's `intents`) that nonetheless deferred, return
+/// it — the signal to retry with the home location folded into the question. Returns
+/// `None` when the choice was open-ended, low-confidence, or not location-dependent.
+fn confident_location_intent<'a>(
+    resp: &'a Value,
+    intents: &[String],
+    min_confidence: f64,
+) -> Option<&'a str> {
+    let intent = resp.get("answers")?.get("intent")?;
+    let choice = intent.get("choice").and_then(Value::as_str)?;
+    if !LOCATION_INTENTS.contains(&choice) || !intents.iter().any(|i| i == choice) {
+        return None;
+    }
+    if choice_confidence(Some(intent)) >= min_confidence {
+        Some(choice)
+    } else {
+        None
+    }
+}
+
 /// Read a `choice`/`score` answer's calibrated `confidence` (0.0 when absent). The
 /// OpenRouter Jev `/v1/systemone` response names this field `confidence`; a local
 /// `laya-serve` build that instead emits `answer_confidence` is also accepted. `noul`
@@ -318,6 +372,30 @@ mod tests {
         assert_eq!(
             interpret(&resp("philosophy", 0.99, 0.01), &intents(), 0.85),
             Decision::Defer
+        );
+    }
+
+    #[test]
+    fn confident_location_intent_flags_deferred_weather_for_retry() {
+        // Confident `weather` that deferred (high noul) → retry candidate.
+        let deferred_weather = resp("weather", 0.99, 0.94);
+        assert_eq!(
+            confident_location_intent(&deferred_weather, &intents(), 0.85),
+            Some("weather")
+        );
+        // A confident but non-location intent (`timer`) is never retried.
+        assert_eq!(
+            confident_location_intent(&resp("timer", 0.99, 0.9), &intents(), 0.85),
+            None
+        );
+        // Low-confidence or open-ended choices are not retried.
+        assert_eq!(
+            confident_location_intent(&resp("weather", 0.50, 0.94), &intents(), 0.85),
+            None
+        );
+        assert_eq!(
+            confident_location_intent(&resp("other", 0.99, 0.94), &intents(), 0.85),
+            None
         );
     }
 

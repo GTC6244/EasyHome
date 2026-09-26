@@ -129,6 +129,11 @@ pub struct DecisionRequest {
     /// Recent `(user, assistant)` turns for follow-up disambiguation. Empty for an
     /// ordinary single-shot turn. Populated in M1.
     pub history: Vec<(String, String)>,
+    /// The household home location (e.g. `"Austin, Texas"`), from `LiveHomeLocation`.
+    /// Location-dependent intents like `weather` are ambiguous without a place, so the
+    /// HTTP engine uses this to retry an otherwise-deferred turn with the location folded
+    /// into the question. `None` when unset — no retry, the turn just defers.
+    pub location: Option<String>,
 }
 
 /// A resolved fast intent. M1+ extends this with structured args so the orchestrator
@@ -240,6 +245,7 @@ mod tests {
             transcript: t.to_string(),
             screen: None,
             history: Vec::new(),
+            location: None,
         }
     }
 

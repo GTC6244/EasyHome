@@ -684,6 +684,9 @@ impl Pipeline {
                 transcript: transcript.to_string(),
                 screen: None,        // M1: derive a label from the turn's `screen` context
                 history: Vec::new(), // M1: recent turns for follow-up disambiguation
+                // Home location grounds location-dependent intents (weather): the HTTP
+                // engine retries an otherwise-deferred turn with this folded into the query.
+                location: self.settings.home_location().get(),
             };
             match runtime.system1.engine.decide(&req).await {
                 Ok(crate::system1::Decision::Resolve(r)) => {
